@@ -107,3 +107,64 @@ git diff --check
 - 涉及启动、IPC、UI、安装迁移、更新或打包，补充对应真实流程验收。Windows 路径/进程/安装行为必须有 Windows 验证；其他平台通过不能代替。
 - 发版遵循 release runbook 和目标原生构建脚本，不绕过 `verify-target`。PR 检查通过或本地打包成功不等于正式发布。
 - 交付写清改动、原因、实际运行的检查、未完成的验收与限制。不得把尚未执行的检查写成通过。
+
+## 5. macOS Monterey 本机兼容与上游同步（2026-11-07）
+
+### 今日工作与环境基线
+
+- 本机为 Intel Mac（`darwin/x64`）、macOS 12.7.6 Monterey。仓库开发版本使用 NVM 管理的 Node.js 24；根目录 `.nvmrc` 固定到 Node 24 大版本。
+- 当前 `@deepseek-ai/dsh@0.2.2-alpha.2` 的安装约束为 Node.js `>=24.9.0`。不能只依据旧文档中的 Node 22 说明选择运行时；安装依赖前同时检查根包和实际锁定依赖的 `engines`。
+- Electron 固定为精确版本 `43.0.0`，不要改成范围。`package.json`、`package-lock.json`、`docs/development.md` 和 `docs/release-runbook.md` 中的版本与兼容性说明应作为同一组变更维护。
+
+### Electron 兼容性结论
+
+本机排查得到的是两层独立约束，两者必须同时满足：
+
+| 版本 | macOS 12 结果 | 结论 |
+| --- | --- | --- |
+| Electron 44.7.0 | 可执行文件最低系统版本为 macOS 13，启动时因缺少 `SMAppService` 相关符号退出 | 不兼容 Monterey |
+| Electron 43.8.7 | Electron 窗口可以启动，但当前 Harness 原生 loader 不接受其 Node/V8 指纹 | 不能用于当前锁定依赖 |
+| Electron 43.0.0 | 最低系统版本为 macOS 12；内置 Node 24.17.0，匹配当前原生 loader 指纹 | 当前 Monterey 基线 |
+
+- 不要机械升级或回退 Electron。先确认 Electron 二进制的 macOS 最低版本，再用 `scripts/verify-target.mjs` 和 `scripts/probe-electron-node-runtime.mjs` 验证当前依赖实际支持的精确运行时指纹。
+- 仅看到 Electron 进程、窗口、HTTP 200 或 `Harness is ready` 都不代表桌面应用验收完成；还要确认真实 Harness UI 已渲染并可交互。
+- 若以后升级 macOS，也不能据此单独升级 Electron；仍需当前 `@deepseek-ai/dsh` 原生 loader 明确支持目标 Electron 内置的 Node/V8 组合。
+
+### 慢速网络、代理与构建缓存经验
+
+- 不把个人代理地址或镜像地址写入仓库配置。代理、npm registry 和 Electron mirror 只作为本机安装时的临时环境配置。
+- `npm ci` 遇到锁文件中的历史镜像地址较慢时，可临时使用官方 npm registry 并替换下载 host；Electron 大文件可通过可信镜像下载，但必须保留安装脚本的 checksum 校验。
+- Office runtime 下载脚本使用 Node `fetch`，需要代理时应显式启用 Node 的环境代理支持。大文件可预先放入 `.build/office-downloads/` 的 SHA 地址缓存；缓存文件必须逐项校验期望 SHA。
+- `.build/`、开发 Profile、下载产物和任何本机凭据都属于本地状态，不能加入提交。复用缓存是加速手段，不得通过关闭完整性校验来换取速度。
+
+### 本机验证流程
+
+在仓库根目录使用 Node 24，并依次执行：
+
+```bash
+nvm use
+npm ci
+npm run typecheck
+npm run build
+node scripts/verify-target.mjs darwin x64
+node scripts/probe-electron-node-runtime.mjs
+DSH_DEV_PROFILE=dsh-desktop-dev-<name> \
+  DSH_DEV_HARNESS_PORT=<unique-port> \
+  DSH_DEV_MOBILE_PORT=<unique-port> \
+  npm run dev
+npm test
+git diff --check
+```
+
+- 本次已在独立 Profile 和独立端口启动 Electron 43.0.0，确认插件激活、Harness ready，并人工确认真实 DSH 界面完成渲染。测试实例验收后应正常退出，避免残留后台进程影响下一次验证。
+- 本次还生成了正式身份的本地 Intel 包，包内 Harness、原生模块、终端、依赖清单和 Office 转换门禁通过；安装到 `/Applications/DSH Desktop.app` 后从安装路径启动并再次确认 Harness ready。该包未使用开发者证书签名或 Apple 公证，只用于本机，不是正式发布证据。
+- `verify-target` 通过只证明目标二进制和原生 loader 的预检通过；`probe-electron-node-runtime`、正式构建与真实 UI 启动仍然不可省略。
+- macOS 验证不能替代 Windows 原生打包与安装验证。涉及 Windows 产物的上游变更仍须在 Windows runner 上验收。
+
+### 后续合并上游的处理规则
+
+- fork 的 `origin` 是 `liangliangpan/dsh-desktop`；源项目应配置为 `upstream`（`dataelement/dsh-desktop`）。同步前先 `git fetch upstream`，在单独主题分支中合并或 rebase，不直接在带有未提交本机兼容改动的工作区操作。
+- 上游若把 Electron 升回 44 或更高，在仍需支持 Monterey 时保留 43.0.0，并重新生成锁文件；不要只解决文本冲突后接受上游版本。
+- 上游若更新 `@deepseek-ai/dsh`、原生 loader、postinstall patch、Electron 或 Node 最低版本，旧的 43.0.0 结论可能失效。先检查新 loader 支持的精确指纹，再决定继续保留 43.0.0、换到另一个 43.x，或在提升 macOS 基线后升级 Electron。
+- 合并后重新执行 postinstall、目标预检、运行时探针、完整构建、测试和真实 UI 验收。特别检查 `package.json`、`package-lock.json`、`docs/development.md`、`docs/release-runbook.md`、`.nvmrc` 以及 `scripts/verify-target.mjs` 是否仍相互一致。
+- 合并提交中不要带入 `.build/office-downloads/`、开发 Profile、日志、截图或密钥；这些内容即使能帮助复现，也应通过文字记录和可重复命令传递。
