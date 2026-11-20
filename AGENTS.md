@@ -12,15 +12,25 @@ DSH Desktop 是 Electron 宿主，复用 Harness runtime 和 Web UI。保持这�
 
 | 目录 | 职责 / 专项规则 |
 | --- | --- |
-| `src/main/` | 原生能力、运行时编排、Profile、更新、手机桥接和企业登录；见该目录 `AGENTS.md` |
+| `src/main/` | 原生能力、运行时编排、Profile、更新、手机桥接和企业登录；见该目录 `AGENTS.md`。正式主进程在 `src/main/shell/`，规则见该目录 `AGENTS.md` |
+| `src/host/` | Harness 子进程入口，不导入 Electron；见该目录 `AGENTS.md` |
 | `src/preload/` | 窄 IPC 桥和桌面 UI 接缝；见该目录 `AGENTS.md` |
 | `src/shared/` | 跨进程数据契约和纯逻辑；不得依赖 main/preload、Electron 或 Node 特权 API |
 | `packages/` | 宿主插件、运行时包和第三方分发包；见该目录 `AGENTS.md` |
 | `patches/` | 可重放的第三方兼容补丁；见该目录 `AGENTS.md` |
-| `build/` | 打包输入，包括 HTML 页面和运行时入口；见该目录 `AGENTS.md` |
+| `build/` | 打包输入，包括 HTML 页面、Office CLI 和 pnpm 调用；见该目录 `AGENTS.md` |
 | `scripts/`、`test/` | 构建发布工具、行为与契约回归测试 |
 
 先阅读受影响模块和测试；涉及架构时阅读 `docs/architecture.md`，开发和发布分别参考 `docs/development.md`、`docs/release-runbook.md`。实际依赖与命令以当前 `package.json`、锁文件、构建配置和 workflow 为准；发现文档过期时修正文档，不按旧版本描述修改代码。
+
+### 移植代码
+
+官方 Desktop 与 Host 按模块改写进本仓库，不把上游源码原样放进仓库。每个移植模块登记在根目录 `upstream-baseline.json`：`path` 是本仓库文件，`upstream` 是基线提交里的路径，`divergences` 写有意差异。不移植的上游文件写入 `skipped`，且必须是基线提交里真实存在的路径。
+
+- 改写沿用本仓库的 TypeScript、两空格、单引号和无分号风格。上游行为变化写进 `divergences`，不靠注释里的机器路径说明。
+- 对版本敏感的上游类型和调用集中到对应目录的 `upstream-api.ts`。该文件还没有；新增这类调用时先建它。
+- 新壳测试放 `test/shell/`，Host 子进程测试放 `test/host/`。会启动 Electron 子进程的文件列入 `vitest.config.ts` 的 `WINDOWS_SERIAL_SUITES`。
+- 本仓库提交说明用中文。改动基线的 PR 按模块列出移植、有意差异和跳过。
 
 ## 2. 代码规范
 
@@ -56,11 +66,11 @@ DSH Desktop 是 Electron 宿主，复用 Harness runtime 和 Web UI。保持这�
 | Desktop 安装目录 | 当前运行版本携带的 Harness、宿主插件和受控依赖 | 不作为所有缺包的通用搜索目录，不覆盖插件的普通第三方依赖 |
 
 - 普通 Profile 先从 Profile 解析插件；本地 `file:` 包、symlink 和 Windows junction 必须保持可加载。解析后即使 Node 使用插件的物理路径，插件声明的宿主 peer 仍应连接到当前 Desktop 携带的兼容实现。
-- 依赖解析顺序是“插件自身/正常 Node 解析 → 明确的宿主依赖 fallback”。宿主 fallback 只允许覆盖约定的宿主包命名空间（当前为 `@deepseek-ai/*`），且只在正常解析得到 `ERR_MODULE_NOT_FOUND` 时启用；不得用全局 `NODE_PATH`、改变 `cwd` 或把安装目录作为任意包的兜底。
-- Safe Mode 是例外但不是第二套模糊规则：它只加载安装包自带的包，可以显式使用宿主 anchor，并且不能依赖普通 Profile 的共享 fallback。普通 Profile 不得套用 Safe Mode 的“所有 bare package 都从宿主解析”语义。
-- fallback 必须遵守 `exports`、子路径和当前实际运行安装目录，不能硬编码开发仓库的 `node_modules` 或机器绝对路径；应用升级后不得继续引用旧安装 generation。
-- 加载失败须保留最内层的包名、父模块和解析阶段。外层插件首次查找失败、fallback 失败和插件内部 peer 缺失不能互相覆盖，不能把“插件内部缺少宿主依赖”误报成“插件不存在”。
-- 修改启动入口、loader、Profile 投影、generation 或依赖闭包时，至少验证：安装包内置插件、普通市场插件、本地软链接插件、缺少宿主 peer、插件自带普通依赖、Safe Mode 无 `profiles/node_modules`；涉及 Windows 时补 junction 与物理路径验证。
+- 普通 Profile 按插件自身路径解析。缺少宿主 peer 和缺少普通依赖都保留原始 `ERR_MODULE_NOT_FOUND`，不注册一套把 `@deepseek-ai/*` 改从安装目录再找一次的 fallback，也不用全局 `NODE_PATH` 或调用者 `cwd` 兜底。
+- Safe Mode 只加载安装包自带的包，由上游安装锚点解析核心包，不创建 `profiles/node_modules`。普通 Profile 不得套用这套“所有 bare package 都从宿主解析”的语义。
+- 解析必须遵守 `exports`、子路径和当前实际运行安装目录，不能硬编码开发仓库的 `node_modules` 或机器绝对路径；应用升级后不得继续引用旧安装 generation。
+- 加载失败须保留最内层的包名、父模块和解析阶段。外层插件首次查找失败和插件内部 peer 缺失不能互相覆盖，不能把“插件内部缺少宿主依赖”误报成“插件不存在”。
+- 修改启动入口、loader、Profile 投影、generation 或依赖闭包时，至少验证：安装包内置插件、普通市场插件、本地软链接插件、缺少宿主 peer、插件自带普通依赖、Safe Mode 无 `profiles/node_modules`；涉及 Windows 时补 junction 与物理路径验证。启动前的复制、投影和 Safe Mode 顺序见 `src/main/shell/AGENTS.md`。
 - 单元测试中 `import` 成功只证明源码路径可达。交付前还要按影响范围验证实际 Harness 子进程、打包资源清单及安装后的应用；已安装旧版本未重建时不得声称修复已在正式版生效。
 
 ### 后端与客户端启动协议
@@ -84,7 +94,7 @@ DSH Desktop 是 Electron 宿主，复用 Harness runtime 和 Web UI。保持这�
 ### 加载链路变更的提交要求
 
 - 实现前写清：改动属于上表哪一阶段、读取哪个目录、采用哪个解析基准、影响普通 Profile 还是 Safe Mode、失败时如何保留原始诊断与恢复入口。不能用在开发仓库中导入成功来推断正式安装包可用。
-- 回归优先走真实子进程和临时 Profile，分别覆盖正常、缺包及错误路径；客户端改动验证认证后的 HTML、bootstrap 响应及执行注册，再补真实浏览器/UI 验收。相关入口包括 `test/harness-node-entry.test.ts`、`test/plugin-startup-failure.test.ts`、`test/safe-mode-host-resolved.test.ts`、`test/safe-mode-runtime.test.ts` 和 `test/desktop-plugin-closure.test.ts`，按实际改动选择并扩展行为覆盖。
+- 回归优先走真实子进程和临时 Profile，分别覆盖正常、缺包及错误路径；客户端改动验证认证后的 HTML、bootstrap 响应及执行注册，再补真实浏览器/UI 验收。相关入口包括 `test/host/run-profile.test.ts`、`test/host/plugin-resolution.test.ts`、`test/shell/boot-session.test.ts`、`test/safe-mode-host-resolved.test.ts` 和 `test/desktop-plugin-closure.test.ts`，按实际改动选择并扩展行为覆盖。
 - 交付说明列出已验证阶段和未验证阶段；规则中的验收要求不代表现有测试或 CI 已全部覆盖。声称版本回归须有完整版本/安装产物、Profile 状态与启动路径的对照，单独替换一个 loader 文件的实验不能替代整应用版本对比。
 
 ## 4. 验证与交付
@@ -103,7 +113,8 @@ git diff --check
 - 纯文档修改只需检查差异、链接和命令真实性；不要求启动应用或重装依赖。
 - 功能开发把相关单元测试纳入同一次改动，不能只改实现。先定位覆盖该模块、输入输出、状态转换或失败路径的测试文件；新行为补能捕获偏差的用例，契约变化则更新对应断言。测试文件的增删改与实现一并评审：断言改动要说明旧契约、新契约，以及失败时会抓住什么。与本次功能无关的测试整理不混入。交付说明列出变动的测试文件和实际运行结果。
 - 行为修复应有能捕获该缺陷的回归，优先验证输入、输出、状态转换和失败路径。字符串/源码契约测试只作为补充，不能替代行为验证。
-- 当前 `typecheck` 只覆盖配置及 `src/main`、`src/preload`、`src/shared`、TS 测试；插件 JS、脚本和 HTML 不在其覆盖范围。当前没有 `npm run lint` 或 `npm run format:check`，不得报告它们通过。
+- 当前 `typecheck` 覆盖配置及 `src/main`、`src/host`、`src/preload`、`src/shared`、TS 测试；插件 JS、脚本和 HTML 不在其覆盖范围。当前没有 `npm run lint` 或 `npm run format:check`，不得报告它们通过。
+- 壳行为测试在 `test/shell/`，Host 子进程测试在 `test/host/`。`npm run build` 只证明正式入口能编译；安装和进入工作区要单独验收。
 - 涉及启动、IPC、UI、安装迁移、更新或打包，补充对应真实流程验收。Windows 路径/进程/安装行为必须有 Windows 验证；其他平台通过不能代替。
 - 发版遵循 release runbook 和目标原生构建脚本，不绕过 `verify-target`。PR 检查通过或本地打包成功不等于正式发布。
 - 交付写清改动、原因、实际运行的检查、未完成的验收与限制。不得把尚未执行的检查写成通过。
@@ -113,7 +124,7 @@ git diff --check
 ### 今日工作与环境基线
 
 - 本机为 Intel Mac（`darwin/x64`）、macOS 12.7.6 Monterey。仓库开发版本使用 NVM 管理的 Node.js 24；根目录 `.nvmrc` 固定到 Node 24 大版本。
-- 当前 `@deepseek-ai/dsh@0.2.2-alpha.2` 的安装约束为 Node.js `>=24.9.0`。不能只依据旧文档中的 Node 22 说明选择运行时；安装依赖前同时检查根包和实际锁定依赖的 `engines`。
+- 当前 `@deepseek-ai/dsh@0.2.2-rc.1`（上游 V0.14.0）的安装约束仍为 Node.js `>=24.9.0`。不能只依据旧文档中的 Node 22 说明选择运行时；安装依赖前同时检查根包和实际锁定依赖的 `engines`。
 - Electron 固定为精确版本 `43.0.0`，不要改成范围。`package.json`、`package-lock.json`、`docs/development.md` 和 `docs/release-runbook.md` 中的版本与兼容性说明应作为同一组变更维护。
 
 ### Electron 兼容性结论
@@ -126,7 +137,7 @@ git diff --check
 | Electron 43.8.7 | Electron 窗口可以启动，但当前 Harness 原生 loader 不接受其 Node/V8 指纹 | 不能用于当前锁定依赖 |
 | Electron 43.0.0 | 最低系统版本为 macOS 12；内置 Node 24.17.0，匹配当前原生 loader 指纹 | 当前 Monterey 基线 |
 
-- 不要机械升级或回退 Electron。先确认 Electron 二进制的 macOS 最低版本，再用 `scripts/verify-target.mjs` 和 `scripts/probe-electron-node-runtime.mjs` 验证当前依赖实际支持的精确运行时指纹。
+- 不要机械升级或回退 Electron。先确认 Electron 二进制的 macOS 最低版本，再用 `scripts/verify/verify-target.mjs` 和 `scripts/verify/probe-electron-node-runtime.mjs` 验证当前依赖实际支持的精确运行时指纹。
 - 仅看到 Electron 进程、窗口、HTTP 200 或 `Harness is ready` 都不代表桌面应用验收完成；还要确认真实 Harness UI 已渲染并可交互。
 - 若以后升级 macOS，也不能据此单独升级 Electron；仍需当前 `@deepseek-ai/dsh` 原生 loader 明确支持目标 Electron 内置的 Node/V8 组合。
 
@@ -146,8 +157,8 @@ nvm use
 npm ci
 npm run typecheck
 npm run build
-node scripts/verify-target.mjs darwin x64
-node scripts/probe-electron-node-runtime.mjs
+node scripts/verify/verify-target.mjs darwin x64
+node scripts/verify/probe-electron-node-runtime.mjs
 DSH_DEV_PROFILE=dsh-desktop-dev-<name> \
   DSH_DEV_HARNESS_PORT=<unique-port> \
   DSH_DEV_MOBILE_PORT=<unique-port> \
@@ -166,5 +177,12 @@ git diff --check
 - fork 的 `origin` 是 `liangliangpan/dsh-desktop`；源项目应配置为 `upstream`（`dataelement/dsh-desktop`）。同步前先 `git fetch upstream`，在单独主题分支中合并或 rebase，不直接在带有未提交本机兼容改动的工作区操作。
 - 上游若把 Electron 升回 44 或更高，在仍需支持 Monterey 时保留 43.0.0，并重新生成锁文件；不要只解决文本冲突后接受上游版本。
 - 上游若更新 `@deepseek-ai/dsh`、原生 loader、postinstall patch、Electron 或 Node 最低版本，旧的 43.0.0 结论可能失效。先检查新 loader 支持的精确指纹，再决定继续保留 43.0.0、换到另一个 43.x，或在提升 macOS 基线后升级 Electron。
-- 合并后重新执行 postinstall、目标预检、运行时探针、完整构建、测试和真实 UI 验收。特别检查 `package.json`、`package-lock.json`、`docs/development.md`、`docs/release-runbook.md`、`.nvmrc` 以及 `scripts/verify-target.mjs` 是否仍相互一致。
+- 合并后重新执行 postinstall、目标预检、运行时探针、完整构建、测试和真实 UI 验收。特别检查 `package.json`、`package-lock.json`、`docs/development.md`、`docs/release-runbook.md`、`.nvmrc` 以及 `scripts/verify/verify-target.mjs` 是否仍相互一致。
 - 合并提交中不要带入 `.build/office-downloads/`、开发 Profile、日志、截图或密钥；这些内容即使能帮助复现，也应通过文字记录和可重复命令传递。
+
+### V0.14.0 合并复核（2026-11-20）
+
+- 上游 V0.14.0（`bbc7494`）把 Harness 升到 `0.2.2-rc.1`、cordis 升到 4.1.0，并把壳改写为 `src/main/shell/` + `src/host/` 移植结构；Electron 仍是 44.7.0。本分支合并时保留 Electron `43.0.0` 与 Node 24 基线。
+- 原生 loader `node-addon-require-builtin` 仍锁定 `0.1.9`，其 darwin-x64 预编译指纹白名单包含 43.0.0；`scripts/verify/verify-target.mjs darwin x64` 与 `scripts/verify/probe-electron-node-runtime.mjs` 在 rc.1 依赖下均通过（Electron 43.0.0 / Node 24.17.0，认证 HTTP 200）。43.0.0 基线对 rc.1 继续有效。
+- 本机 nvm Node 24.21.0 携带的 npm 11.19 默认拦截依赖安装脚本（上游 CI 用 Node 22/npm 10 不受影响）。已在 `package.json` 增加按版本钉住的 `allowScripts`（esbuild、koffi、node-pty、protobufjs、fsevents、@google/genai、@deepseek-ai/dsh-subprocess-local），这是相对上游的有意本地差异；升级这些包时需要重新审阅并批准对应版本。
+- 合并后已在独立开发 Profile（`dsh-desktop-dev-v0140`）确认真实 UI 渲染与会话写入；脚本路径统一为 `scripts/verify/`、`scripts/release/`、`scripts/ppt/`，引用旧路径的文档按新路径维护。
