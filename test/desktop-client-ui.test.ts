@@ -88,9 +88,12 @@ describe('DSH Desktop client slot occupants', () => {
     plugin.apply({ slots, locale: { register: () => () => undefined, bind: () => (key: string) => key }, effect: (setup: () => (() => void) | undefined) => { disposeStyle = setup() } })
 
     expect(plugin.inject).toEqual(['locale', 'slots', 'remote.session', 'sessions', 'uiWorkspace'])
+    // 新契约：除品牌与既有设置入口外，再占用一个通用设置项承载「性能模式」开关。
+    // 旧契约只有品牌座位和企业版入口（10 项），新增项排在 sidebar.settings.action 之后。
     expect(registrations.map(({ config }) => config.name)).toEqual([
       'conversation.input.dock',
       'sidebar.settings.action',
+      'settings.general.item',
       'settings.sidebar.footer',
       'sidebar.brand.mark',
       'sidebar.brand.name',
@@ -100,6 +103,8 @@ describe('DSH Desktop client slot occupants', () => {
       'sidebar.workspaces.session.menu.item',
       'sidebar.workspaces.session.menu.item'
     ])
+    const perfSetting = registrations.find(({ config }) => config.id === 'desktop-perf-mode')
+    expect(perfSetting?.config.name).toBe('settings.general.item')
     const enterprise = registrations.find(({ config }) => config.name === 'settings.sidebar.footer')
     expect(enterprise?.config.id).toBe('desktop-enterprise-entry')
     const entry = enterprise!.component({ t: () => '了解企业版' }) as { type: unknown; props: Record<string, unknown> }
@@ -137,5 +142,116 @@ describe('DSH Desktop client slot occupants', () => {
     )!.component({ size: 48 }) as { type: unknown; props: Record<string, unknown> }
     expect(heroMark.type).toBe(FishLogo)
     expect(heroMark.props.size).toBe(48)
+  })
+
+  // 性能模式会替换全局 requestAnimationFrame；这条用例保证它只在用户开启时生效，
+  // 并且在插件销毁后把样式与全局函数都还原，避免热重载或退出后留下副作用。
+  it('applies the opt-in performance mode and restores every global on dispose', async () => {
+    const source = await readFile(
+      path.join(projectRoot, 'packages', 'dsh-desktop-client-ui', 'client.js'),
+      'utf8'
+    )
+
+    const boot = (storedPreference: string | null) => {
+      let definition:
+        | { factory: (require: (id: string) => unknown) => { apply: (ctx: unknown) => void } }
+        | undefined
+      const styles = new Map<string, { id: string; textContent: string }>()
+      const document = {
+        getElementById: (id: string) => styles.get(id) ?? null,
+        createElement: () => {
+          const node = {
+            id: '',
+            textContent: '',
+            remove: () => {
+              styles.delete(node.id)
+            }
+          }
+          return node
+        },
+        head: {
+          appendChild: (node: { id: string; textContent: string }) => {
+            styles.set(node.id, node)
+            return node
+          }
+        }
+      }
+      const originalFrame = vi.fn()
+      const originalCancel = vi.fn()
+      const window = {
+        __ModuleLoader__: {
+          load: (value: unknown) => {
+            definition = value as typeof definition
+          }
+        },
+        dshDesktop: { getRepairDraft: vi.fn(), openRepairAgent: vi.fn() },
+        localStorage: {
+          getItem: (key: string) => (key === 'dsh-desktop.perf-mode' ? storedPreference : null),
+          setItem: vi.fn(),
+          removeItem: vi.fn()
+        },
+        requestAnimationFrame: originalFrame,
+        cancelAnimationFrame: originalCancel,
+        setTimeout: vi.fn(() => 1),
+        clearTimeout: vi.fn()
+      }
+      vm.runInNewContext(source, {
+        document,
+        navigator: { language: 'en-US' },
+        performance: { now: () => 0 },
+        console,
+        window
+      })
+      if (!definition) throw new Error('Expected the client plugin definition')
+      const plugin = definition.factory((id) => {
+        if (id === 'react') {
+          return {
+            createElement: () => null,
+            useEffect: () => undefined,
+            useLayoutEffect: () => undefined,
+            useSyncExternalStore: () => false,
+            useState: (initial: unknown) => [initial, vi.fn()]
+          }
+        }
+        if (id === '@deepseek-ai/dsh-client-ui-primitives') {
+          return {
+            BrandWordmark: 'brand',
+            FishLogo: 'fish',
+            MenuItemButton: 'item',
+            Switch: 'switch',
+            Tooltip: 'tooltip'
+          }
+        }
+        throw new Error(`Unexpected client dependency: ${id}`)
+      })
+      const disposers: Array<() => void> = []
+      plugin.apply({
+        effect: (setup: () => (() => void) | undefined) => {
+          const dispose = setup()
+          if (dispose) disposers.push(dispose)
+        },
+        locale: { register: () => () => undefined, bind: () => (key: string) => key },
+        slots: {
+          inject: (_name: string, callback: () => unknown) => callback(),
+          register: () => () => undefined
+        }
+      })
+      return { styles, window, originalFrame, originalCancel, disposers }
+    }
+
+    const enabled = boot('1')
+    expect(enabled.styles.get('dsh-desktop-perf-mode-style')?.textContent).toContain(
+      'animation-iteration-count:1'
+    )
+    expect(enabled.window.requestAnimationFrame).not.toBe(enabled.originalFrame)
+    for (const dispose of enabled.disposers.reverse()) dispose()
+    expect(enabled.styles.has('dsh-desktop-perf-mode-style')).toBe(false)
+    expect(enabled.window.requestAnimationFrame).toBe(enabled.originalFrame)
+    expect(enabled.window.cancelAnimationFrame).toBe(enabled.originalCancel)
+
+    const disabled = boot(null)
+    expect(disabled.styles.has('dsh-desktop-perf-mode-style')).toBe(false)
+    expect(disabled.window.requestAnimationFrame).toBe(disabled.originalFrame)
+    expect(disabled.window.cancelAnimationFrame).toBe(disabled.originalCancel)
   })
 })

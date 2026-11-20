@@ -6,7 +6,7 @@ window.__ModuleLoader__.load({
     Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' })
 
     const React = require('react')
-    const { BrandWordmark, FishLogo, MenuItemButton, Tooltip } = require('@deepseek-ai/dsh-client-ui-primitives')
+    const { BrandWordmark, FishLogo, MenuItemButton, Switch, Tooltip } = require('@deepseek-ai/dsh-client-ui-primitives')
 
     // Tight bounds of the mark inside its 1000x1000 source artwork.
     const BRAND_MARK_VIEWBOX = { x: 42, y: 218, width: 898, height: 564 }
@@ -293,6 +293,202 @@ window.__ModuleLoader__.load({
     }
 
     const inject = ['locale', 'slots', 'remote.session', 'sessions', 'uiWorkspace']
+    // ── 性能模式 ───────────────────────────────────────────────────────────
+    // 长会话流式输出时，渲染进程的开销主要来自整窗高频更新：无限动画
+    // （spinner / 状态点）持续出帧，前端又把流式刷新合并到每一帧的 rAF 回调里。
+    // 性能模式让无限动画只跑完一轮、并把 rAF 合并间隔放宽到约 15fps；
+    // 不修改上游 CSS/JS，也不依赖主进程或启动开关，随时可以关掉。
+    const PERF_NS = 'dsh-desktop-perf-mode'
+    const PERF_STORAGE_KEY = 'dsh-desktop.perf-mode'
+    const PERF_STYLE_ID = 'dsh-desktop-perf-mode-style'
+    const PERF_SETTING_STYLE_ID = 'dsh-desktop-perf-mode-setting-style'
+    // 66ms ≈ 15fps：足以让流式文本仍然连续，同时明显减少重排与出帧次数。
+    const PERF_FRAME_INTERVAL_MS = 66
+
+    const perfMessages = {
+      zh: {
+        title: '性能模式',
+        description: '降低界面刷新频率以减少 CPU 占用：加载动画只播放一轮，滚动与过渡会略简。长时间生成任务或风扇噪音明显时更合适。'
+      },
+      en: {
+        title: 'Performance mode',
+        description: 'Reduce the interface refresh rate to lower CPU usage: loading animations play once and scrolling feels slightly less smooth. Useful during long generations or when fan noise is noticeable.'
+      },
+      ja: {
+        title: 'パフォーマンスモード',
+        description: '画面の更新頻度を下げて CPU 使用率を抑えます。読み込みアニメーションは一度だけ再生され、スクロールやトランジションはやや簡略になります。長時間の生成やファンの音が気になる場合に適しています。'
+      },
+      es: {
+        title: 'Modo de rendimiento',
+        description: 'Reduce la frecuencia de actualización de la interfaz para disminuir el uso de CPU: las animaciones de carga se reproducen una sola vez y el desplazamiento resulta algo menos fluido. Útil en generaciones largas o cuando el ruido del ventilador es perceptible.'
+      },
+      fr: {
+        title: 'Mode performance',
+        description: 'Réduit la fréquence de rafraîchissement de l’interface pour limiter l’usage du processeur : les animations de chargement ne jouent qu’une fois et le défilement devient un peu moins fluide. Utile lors de longues générations ou lorsque le bruit du ventilateur se fait entendre.'
+      },
+      de: {
+        title: 'Leistungsmodus',
+        description: 'Verringert die Aktualisierungsrate der Oberfläche, um die CPU-Last zu senken: Ladeanimationen laufen nur einmal, Scrollen wirkt etwas weniger flüssig. Sinnvoll bei langen Generierungen oder wenn das Lüftergeräusch auffällt.'
+      },
+      ru: {
+        title: 'Режим производительности',
+        description: 'Снижает частоту обновления интерфейса, чтобы уменьшить нагрузку на процессор: анимации загрузки проигрываются один раз, прокрутка становится чуть менее плавной. Подходит при длительной генерации или когда слышен шум вентилятора.'
+      },
+      pt: {
+        title: 'Modo de desempenho',
+        description: 'Reduz a taxa de atualização da interface para diminuir o uso de CPU: as animações de carregamento são reproduzidas apenas uma vez e a rolagem fica um pouco menos fluida. Útil em gerações longas ou quando o ruído do ventilador é perceptível.'
+      }
+    }
+
+    const perfMode = createPerfMode()
+
+    function createPerfMode() {
+      const listeners = new Set()
+      let enabled = readPreference()
+      let restoreFrames = null
+      let styleNode = null
+
+      function readPreference() {
+        try {
+          return window.localStorage.getItem(PERF_STORAGE_KEY) === '1'
+        } catch {
+          return false
+        }
+      }
+
+      function persist(next) {
+        try {
+          if (next) window.localStorage.setItem(PERF_STORAGE_KEY, '1')
+          else window.localStorage.removeItem(PERF_STORAGE_KEY)
+        } catch {
+          // 存储不可用时只让本次运行生效，不阻断开关本身。
+        }
+      }
+
+      function ensureStyle() {
+        if (styleNode) return
+        const style = document.createElement('style')
+        style.id = PERF_STYLE_ID
+        // 只约束无限循环动画：跑完一轮停在末态；有限动画和 transition 不受影响。
+        style.textContent = '*,*::before,*::after{animation-iteration-count:1!important}'
+        document.head.appendChild(style)
+        styleNode = style
+      }
+
+      function installFrameThrottle() {
+        const originalFrame = window.requestAnimationFrame
+        const originalCancel = window.cancelAnimationFrame
+        const queued = new Map()
+        let nextId = 1
+        let timer = null
+        let lastRun = 0
+        const flush = () => {
+          timer = null
+          lastRun = performance.now()
+          const batch = [...queued.values()]
+          queued.clear()
+          for (const callback of batch) {
+            try {
+              callback(lastRun)
+            } catch (error) {
+              console.error('perf-mode: animation frame callback failed', error)
+            }
+          }
+        }
+        window.requestAnimationFrame = (callback) => {
+          if (typeof callback !== 'function') return 0
+          const id = nextId++
+          queued.set(id, callback)
+          if (timer === null) {
+            timer = window.setTimeout(flush, Math.max(0, PERF_FRAME_INTERVAL_MS - (performance.now() - lastRun)))
+          }
+          return id
+        }
+        window.cancelAnimationFrame = (id) => {
+          queued.delete(id)
+        }
+        return () => {
+          window.requestAnimationFrame = originalFrame
+          window.cancelAnimationFrame = originalCancel
+          if (timer !== null) {
+            window.clearTimeout(timer)
+            timer = null
+          }
+          queued.clear()
+        }
+      }
+
+      function apply() {
+        if (!enabled) return
+        ensureStyle()
+        if (!restoreFrames) restoreFrames = installFrameThrottle()
+      }
+
+      function unapply() {
+        // 未应用过就不要碰 DOM 与全局函数，避免在非浏览器宿主里产生副作用。
+        if (!styleNode && !restoreFrames) return
+        if (styleNode) {
+          styleNode.remove()
+          styleNode = null
+        }
+        if (restoreFrames) {
+          restoreFrames()
+          restoreFrames = null
+        }
+      }
+
+      function setEnabled(next) {
+        const value = next === true
+        if (value === enabled) return
+        enabled = value
+        persist(value)
+        if (value) apply()
+        else unapply()
+        for (const listener of [...listeners]) listener()
+      }
+
+      return {
+        apply,
+        getSnapshot: () => enabled,
+        setEnabled,
+        subscribe: (listener) => {
+          listeners.add(listener)
+          return () => listeners.delete(listener)
+        },
+        dispose: () => {
+          unapply()
+          listeners.clear()
+        }
+      }
+    }
+
+    function ensurePerfSettingStyle() {
+      if (document.getElementById(PERF_SETTING_STYLE_ID)) return
+      const style = document.createElement('style')
+      style.id = PERF_SETTING_STYLE_ID
+      style.textContent = `
+        [data-dsh-perf-setting]{display:flex;align-items:center;justify-content:space-between;gap:24px;padding:16px 0;border-bottom:.5px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-primary)}
+        [data-dsh-perf-setting-text]{display:flex;flex-direction:column;gap:4px;min-width:0}
+        [data-dsh-perf-setting] strong{font-size:14px;line-height:20px;font-weight:600}
+        [data-dsh-perf-setting] small{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}
+      `
+      document.head.appendChild(style)
+    }
+
+    function PerfModeSetting({ t }) {
+      const enabled = React.useSyncExternalStore(perfMode.subscribe, perfMode.getSnapshot)
+      React.useLayoutEffect(ensurePerfSettingStyle)
+      return React.createElement('div', { 'data-dsh-perf-setting': '' },
+        React.createElement('div', { 'data-dsh-perf-setting-text': '' },
+          React.createElement('strong', null, t('title')),
+          React.createElement('small', null, t('description'))),
+        React.createElement(Switch, {
+          checked: enabled,
+          label: t('title'),
+          onChange: (next) => perfMode.setEnabled(next)
+        }))
+    }
+
     function apply(ctx) {
       applyRepair(ctx)
       ctx.effect(() => ctx.locale.register(ACTIONS_NS, actionMessages))
@@ -304,6 +500,17 @@ window.__ModuleLoader__.load({
         ru: { learnMore: 'Корпоративная версия' }, pt: { learnMore: 'Conhecer a versão empresarial' }
       }))
       const enterpriseText = ctx.locale.bind(ENTERPRISE_NS)
+      ctx.effect(() => ctx.locale.register(PERF_NS, perfMessages))
+      const perfText = ctx.locale.bind(PERF_NS)
+      // 启动时按已保存的偏好应用；插件重载或退出时还原 rAF 与样式。
+      ctx.effect(() => {
+        perfMode.apply()
+        return () => perfMode.dispose()
+      }, 'perf-mode: runtime')
+      ctx.slots.inject('settings.general.item', () => ctx.slots.register({
+        name: 'settings.general.item', id: 'desktop-perf-mode', locale: PERF_NS,
+        order: 35, inject: () => ({ t: perfText })
+      }, PerfModeSetting))
       ctx.slots.inject('settings.sidebar.footer', () => ctx.slots.register({
         name: 'settings.sidebar.footer', id: 'desktop-enterprise-entry', locale: ENTERPRISE_NS,
         inject: () => ({ t: enterpriseText })
